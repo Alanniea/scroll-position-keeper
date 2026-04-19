@@ -1,0 +1,10 @@
+{
+    "id": "scroll-position-keeper",
+    "name": "Scroll Position Keeper",
+    "version": "1.0.0",
+    "minAppVersion": "0.15.0",
+    "description": "保持文件滚动位置,重启后自动恢复",
+    "author": "Your Name",
+    "authorUrl": "",
+    "isDesktopOnly": false
+}
