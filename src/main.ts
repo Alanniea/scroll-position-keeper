@@ -1,5 +1,8 @@
 import { App, Plugin, PluginSettingTab, Setting, MarkdownView, TFile, debounce } from 'obsidian';
 
+// =======================================================
+// 1. 设置接口与默认值
+// =======================================================
 interface RememberScrollSettings {
     maxHistory: number;
     rememberCursor: boolean;
@@ -17,87 +20,62 @@ interface PluginData {
     history: Record<string, any>;
 }
 
+// =======================================================
+// 2. 主插件类
+// =======================================================
 export default class RememberScrollPlugin extends Plugin {
     settings: RememberScrollSettings;
     historyMap: Map<string, any> = new Map();
     requestSaveData: () => void;
-    isUnloading = false; 
-
-    // 恢复锁：防止恢复过程中被覆盖为 0
-    restoringFiles: Set<string> = new Set();
-
-    // 🌟 核心追踪器 1：记录每个标签页(Leaf)最后加载的文件。用来判断是“新打开”还是“只是切回来看一眼”
-    lastLoadedFileInLeaf: Map<string, string> = new Map();
-    
-    // 🌟 核心追踪器 2：记录上一次活跃的视图。用来在离开标签页的瞬间，精准保存旧标签页的状态
-    lastActiveView: MarkdownView | null = null;
+    isUnloading = false; // 标记是否正在关闭软件，防止覆盖脏数据
 
     async onload() {
-        console.log('Loading Remember Scroll Position plugin (V6 Perfect Tab Sync)');
+        console.log('Loading Remember Scroll Position plugin (V3.1 Fixed)');
 
+        // 1. 加载数据并初始化
         await this.loadPluginData();
         this.setupDebouncer();
+
+        // 2. 添加设置面板
         this.addSettingTab(new RememberScrollSettingTab(this.app, this));
 
-        // 1. 软件启动时冷恢复
+        // 🌟【修复核心 1】：处理 Obsidian 刚启动时的冷启动恢复
+        // 必须等待 Obsidian 将初始布局完全画好后，再恢复滚动，否则会被原生机制覆盖
         this.app.workspace.onLayoutReady(() => {
-            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (view && view.file) {
-                this.lastActiveView = view;
-                // 记录当前标签页加载了该文件
-                const leafId = (view.leaf as any).id;
-                this.lastLoadedFileInLeaf.set(leafId, view.file.path);
-                
+            const activeFile = this.app.workspace.getActiveFile();
+            if (activeFile) {
+                // 稍微给一丁点延迟，确保 CodeMirror 编辑器彻底就绪
                 setTimeout(() => {
-                    this.restoreState(view.file!);
+                    this.restoreState(activeFile);
                 }, 100);
             }
         });
 
-        // 2. 监听文件打开
+        // 3. 监听日常文件打开（针对启动后切换标签的情况）
         this.registerEvent(
             this.app.workspace.on('file-open', (file) => {
-                if (!file || !this.app.workspace.layoutReady) return;
-
-                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (!view) return;
-
-                const leafId = (view.leaf as any).id;
-                const previousFile = this.lastLoadedFileInLeaf.get(leafId);
-
-                // 🌟 关键判断：如果这个标签页本来打开的就是这个文件（即用户只是在多标签页间切换）
-                // 插件直接放手！让 Obsidian 原生功能保持当前滚动条，绝对不覆盖。
-                if (previousFile === file.path) {
-                    return; 
+                // 仅当布局已经准备好时才触发，避免与 onLayoutReady 冲突
+                if (file && this.app.workspace.layoutReady) {
+                    this.restoreState(file);
                 }
-
-                // 否则，说明是“新打开”的文件（或者是刚重启后首次加载），记录并恢复！
-                this.lastLoadedFileInLeaf.set(leafId, file.path);
-                this.restoreState(file);
             })
         );
 
-        // 3. 监听切换标签页：精准保存上一个标签页的状态
+        // 4. 监听离开标签页：保存状态
         this.registerEvent(
             this.app.workspace.on('active-leaf-change', () => {
-                // 🌟 在焦点移走的一瞬间，强行保存刚才那个视图的状态（解决手速过快 1 秒定时器没抓到的问题）
-                if (this.lastActiveView) {
-                    this.saveSpecificView(this.lastActiveView);
-                }
-                // 更新当前活跃视图
-                this.lastActiveView = this.app.workspace.getActiveViewOfType(MarkdownView);
+                this.saveCurrentState();
             })
         );
 
-        // 4. 定时保存：防止用户一直停留在一个长笔记里阅读但突然崩溃
+        // 5. 定时检查并保存
         this.registerInterval(
             window.setInterval(() => {
-                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (view) this.saveSpecificView(view);
-            }, 1000)
+                this.saveCurrentState();
+            }, 3000)
         );
 
-        // 5. 文件维护
+        // 6. 监听清理
         this.registerEvent(
             this.app.vault.on('delete', (file) => {
                 if (file instanceof TFile && this.historyMap.has(file.path)) {
@@ -119,10 +97,12 @@ export default class RememberScrollPlugin extends Plugin {
         );
     }
 
+    // 🌟【修复核心 2】：关闭软件时的强制同步保存
     async onunload() {
-        this.isUnloading = true; 
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (view) this.saveSpecificView(view);
+        console.log('Unloading Remember Scroll Position plugin');
+        this.isUnloading = true; // 告诉插件软件正在关闭
+        this.saveCurrentState();
+        // 直接绕过防抖，强行同步写入磁盘，防止数据丢失
         await this.savePluginData(); 
     }
 
@@ -137,67 +117,52 @@ export default class RememberScrollPlugin extends Plugin {
             delete stateToRestore.cursor;
         }
 
-        // 加锁
-        this.restoringFiles.add(file.path);
-
         let retryCount = 0;
-        const maxRetries = 20; 
+        const maxRetries = 15; // 启动时可能较卡，重试次数增加到 15 次 (1.5秒)
 
         const tryRestore = () => {
             const view = this.app.workspace.getActiveViewOfType(MarkdownView);
             if (view && view.file?.path === file.path) {
-                
                 view.setEphemeralState(stateToRestore);
 
-                setTimeout(() => {
-                    const checkView = this.app.workspace.getActiveViewOfType(MarkdownView);
-                    if (!checkView || checkView.file?.path !== file.path) {
-                        this.restoringFiles.delete(file.path);
-                        return;
-                    }
+                const currentState = view.getEphemeralState();
+                const targetScroll = Number(stateToRestore.scroll) || 0;
+                const currentScroll = Number(currentState.scroll) || 0;
 
-                    const currentState = checkView.getEphemeralState();
-                    const targetScroll = Number(stateToRestore.scroll) || 0;
-                    const currentScroll = Number(currentState.scroll) || 0;
-
-                    if (Math.abs(currentScroll - targetScroll) > 0.1 && retryCount < maxRetries) {
-                        retryCount++;
-                        const nextDelay = 50 + (retryCount * 20); 
-                        setTimeout(tryRestore, nextDelay);
-                    } else {
-                        // 解锁
-                        this.restoringFiles.delete(file.path);
-                    }
-                }, 40); 
-            } else {
-                this.restoringFiles.delete(file.path);
+                // 容差设定为 5
+                if (Math.abs(currentScroll - targetScroll) > 5 && retryCount < maxRetries) {
+                    retryCount++;
+                    setTimeout(tryRestore, 100);
+                }
             }
         };
 
-        setTimeout(tryRestore, 100);
+        // 稍微延迟启动第一次恢复
+        setTimeout(tryRestore, 50);
     }
 
-    // 🌟 改造后的保存函数：接收具体的 View，精准保存
-    saveSpecificView(view: MarkdownView) {
-        if (this.isUnloading || !view || !view.file) return; 
+    saveCurrentState() {
+        // 如果软件正在关闭，不再读取试图状态（此时视图可能已经被销毁，会读到 0）
+        if (this.isUnloading) return; 
 
-        const path = view.file.path;
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view && view.file) {
+            const state = view.getEphemeralState();
+            const path = view.file.path;
 
-        // 如果该文件正在执行恢复动画，绝不能覆盖！
-        if (this.restoringFiles.has(path)) return;
+            // 如果读取不到 scroll 属性，直接跳过，防止保存脏数据
+            if (state.scroll === undefined || state.scroll === null) return;
 
-        const state = view.getEphemeralState();
-        if (state.scroll === undefined || state.scroll === null) return;
+            const oldState = this.historyMap.get(path);
+            const isChanged = !oldState || 
+                              oldState.scroll !== state.scroll || 
+                              JSON.stringify(oldState.cursor) !== JSON.stringify(state.cursor);
 
-        const oldState = this.historyMap.get(path);
-        const isChanged = !oldState || 
-                          oldState.scroll !== state.scroll || 
-                          JSON.stringify(oldState.cursor) !== JSON.stringify(state.cursor);
-
-        if (isChanged) {
-            this.historyMap.delete(path);
-            this.historyMap.set(path, state);
-            this.requestSaveData();
+            if (isChanged) {
+                this.historyMap.delete(path);
+                this.historyMap.set(path, state);
+                this.requestSaveData();
+            }
         }
     }
 
