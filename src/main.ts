@@ -27,55 +27,46 @@ export default class RememberScrollPlugin extends Plugin {
     settings: RememberScrollSettings;
     historyMap: Map<string, any> = new Map();
     requestSaveData: () => void;
-    isUnloading = false; // 标记是否正在关闭软件，防止覆盖脏数据
+    isUnloading = false;
+    
+    // 🌟【修复核心 1】：安全锁机制。记录正在被恢复的文件，防止其默认的0状态覆盖历史记录
+    restoringFiles: Set<string> = new Set();
 
     async onload() {
-        console.log('Loading Remember Scroll Position plugin (V3.1 Fixed)');
+        console.log('Loading Remember Scroll Position plugin (V4 Anti-Race-Condition)');
 
-        // 1. 加载数据并初始化
         await this.loadPluginData();
         this.setupDebouncer();
-
-        // 2. 添加设置面板
         this.addSettingTab(new RememberScrollSettingTab(this.app, this));
 
-        // 🌟【修复核心 1】：处理 Obsidian 刚启动时的冷启动恢复
-        // 必须等待 Obsidian 将初始布局完全画好后，再恢复滚动，否则会被原生机制覆盖
+        // 1. 冷启动恢复（App 刚打开时）
         this.app.workspace.onLayoutReady(() => {
             const activeFile = this.app.workspace.getActiveFile();
             if (activeFile) {
-                // 稍微给一丁点延迟，确保 CodeMirror 编辑器彻底就绪
                 setTimeout(() => {
                     this.restoreState(activeFile);
                 }, 100);
             }
         });
 
-        // 3. 监听日常文件打开（针对启动后切换标签的情况）
+        // 2. 日常切换标签页恢复
         this.registerEvent(
             this.app.workspace.on('file-open', (file) => {
-                // 仅当布局已经准备好时才触发，避免与 onLayoutReady 冲突
                 if (file && this.app.workspace.layoutReady) {
                     this.restoreState(file);
                 }
             })
         );
 
-        // 4. 监听离开标签页：保存状态
-        this.registerEvent(
-            this.app.workspace.on('active-leaf-change', () => {
-                this.saveCurrentState();
-            })
-        );
-
-        // 5. 定时检查并保存
+        // 🌟【修复核心 2】：废除 active-leaf-change 事件，改为 1 秒 1 次的后台扫描。
+        // 读取内存极其轻量（消耗 < 1ms），只有位置改变才会触发防抖磁盘写入。
         this.registerInterval(
             window.setInterval(() => {
-                this.saveCurrentState();
-            }, 3000)
+                this.saveAllStates();
+            }, 1000) 
         );
 
-        // 6. 监听清理
+        // 3. 监听文件清理
         this.registerEvent(
             this.app.vault.on('delete', (file) => {
                 if (file instanceof TFile && this.historyMap.has(file.path)) {
@@ -84,7 +75,6 @@ export default class RememberScrollPlugin extends Plugin {
                 }
             })
         );
-
         this.registerEvent(
             this.app.vault.on('rename', (file, oldPath) => {
                 if (file instanceof TFile && this.historyMap.has(oldPath)) {
@@ -97,19 +87,17 @@ export default class RememberScrollPlugin extends Plugin {
         );
     }
 
-    // 🌟【修复核心 2】：关闭软件时的强制同步保存
     async onunload() {
-        console.log('Unloading Remember Scroll Position plugin');
-        this.isUnloading = true; // 告诉插件软件正在关闭
-        this.saveCurrentState();
-        // 直接绕过防抖，强行同步写入磁盘，防止数据丢失
+        this.isUnloading = true;
+        this.saveAllStates(); // 关闭时最后扫描一次所有窗口
         await this.savePluginData(); 
     }
 
     // ================== 核心逻辑 ==================
 
     restoreState(file: TFile) {
-        const savedState = this.historyMap.get(file.path);
+        const path = file.path;
+        const savedState = this.historyMap.get(path);
         if (!savedState) return;
 
         const stateToRestore = { ...savedState };
@@ -117,52 +105,80 @@ export default class RememberScrollPlugin extends Plugin {
             delete stateToRestore.cursor;
         }
 
+        // 🔒 上锁：告诉保存系统，这个文件正在恢复中，千万不要读它的状态！
+        this.restoringFiles.add(path);
+
         let retryCount = 0;
-        const maxRetries = 15; // 启动时可能较卡，重试次数增加到 15 次 (1.5秒)
+        const maxRetries = 15;
 
         const tryRestore = () => {
-            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (view && view.file?.path === file.path) {
+            // 智能查找对应的视图，兼容多开分屏情况
+            let view = this.app.workspace.getActiveViewOfType(MarkdownView);
+            if (!view || view.file?.path !== path) {
+                const leaves = this.app.workspace.getLeavesOfType("markdown");
+                const targetLeaf = leaves.find(l => (l.view as MarkdownView).file?.path === path);
+                if (targetLeaf) view = targetLeaf.view as MarkdownView;
+            }
+
+            if (view) {
                 view.setEphemeralState(stateToRestore);
 
                 const currentState = view.getEphemeralState();
                 const targetScroll = Number(stateToRestore.scroll) || 0;
                 const currentScroll = Number(currentState.scroll) || 0;
 
-                // 容差设定为 5
                 if (Math.abs(currentScroll - targetScroll) > 5 && retryCount < maxRetries) {
                     retryCount++;
                     setTimeout(tryRestore, 100);
+                } else {
+                    // 🔓 解锁：恢复成功或超时放弃后，延迟 500ms 撤销保护锁
+                    setTimeout(() => {
+                        this.restoringFiles.delete(path);
+                    }, 500);
                 }
+            } else {
+                // 如果找不到视图直接解锁
+                this.restoringFiles.delete(path);
             }
         };
 
-        // 稍微延迟启动第一次恢复
         setTimeout(tryRestore, 50);
     }
 
-    saveCurrentState() {
-        // 如果软件正在关闭，不再读取试图状态（此时视图可能已经被销毁，会读到 0）
+    // 🌟【修复核心 3】：扫描并保存所有打开的标签页状态
+    saveAllStates() {
         if (this.isUnloading) return; 
 
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (view && view.file) {
-            const state = view.getEphemeralState();
-            const path = view.file.path;
+        const leaves = this.app.workspace.getLeavesOfType("markdown");
+        let hasChanges = false;
 
-            // 如果读取不到 scroll 属性，直接跳过，防止保存脏数据
-            if (state.scroll === undefined || state.scroll === null) return;
+        leaves.forEach(leaf => {
+            const view = leaf.view as MarkdownView;
+            if (view && view.file) {
+                const path = view.file.path;
 
-            const oldState = this.historyMap.get(path);
-            const isChanged = !oldState || 
-                              oldState.scroll !== state.scroll || 
-                              JSON.stringify(oldState.cursor) !== JSON.stringify(state.cursor);
+                // ⛔【拦截机制】：如果这个文件正戴着“恢复锁”，直接跳过，防止脏数据覆盖
+                if (this.restoringFiles.has(path)) return;
 
-            if (isChanged) {
-                this.historyMap.delete(path);
-                this.historyMap.set(path, state);
-                this.requestSaveData();
+                const state = view.getEphemeralState();
+                if (state.scroll === undefined || state.scroll === null) return;
+
+                const oldState = this.historyMap.get(path);
+                const isChanged = !oldState || 
+                                  oldState.scroll !== state.scroll || 
+                                  JSON.stringify(oldState.cursor) !== JSON.stringify(state.cursor);
+
+                if (isChanged) {
+                    this.historyMap.delete(path);
+                    this.historyMap.set(path, state);
+                    hasChanges = true;
+                }
             }
+        });
+
+        // 只要任何一个标签页有滚动，就通知系统 2 秒后写入硬盘
+        if (hasChanges) {
+            this.requestSaveData();
         }
     }
 
